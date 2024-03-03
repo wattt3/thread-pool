@@ -17,7 +17,7 @@ public class ThreadPool implements Executor {
             threads[i] = new Thread(() -> {
                 try {
                     for (;;){
-                        Runnable task = queue.take();
+                        final Runnable task = queue.take();
                         task.run();
                     }
                 } catch (InterruptedException e) {
@@ -32,7 +32,7 @@ public class ThreadPool implements Executor {
 
     @Override
     public void execute(Runnable command) {
-        if (!started.compareAndSet(false, true)) {
+        if (started.compareAndSet(false, true)) {
             for (Thread thread : threads) {
                 thread.start();
             }

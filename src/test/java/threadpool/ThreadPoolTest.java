@@ -1,15 +1,14 @@
 package threadpool;
 
-import java.util.concurrent.CountDownLatch;
+import java.time.Duration;
 import org.junit.jupiter.api.Test;
 
 class ThreadPoolTest {
 
     @Test
-    void submittedTasksAreExecuted() throws InterruptedException {
-        final ThreadPool executor = new ThreadPool(2);
+    void submittedTasksAreExecuted() {
+        final ThreadPool executor = new ThreadPool(100, Duration.ZERO);
         final int numTasks = 100;
-        final CountDownLatch latch = new CountDownLatch(numTasks);
 
         try {
             for (int i = 0; i < numTasks; i++) {
@@ -19,11 +18,10 @@ class ThreadPoolTest {
                         "Thread `" + Thread.currentThread().getName() + "` executes task "
                             + finalI);
                     try {
-                        Thread.sleep(10);
+                        Thread.sleep(100);
                     } catch (InterruptedException e) {
                         throw new RuntimeException(e);
                     }
-                    latch.countDown();
                 });
             }
 

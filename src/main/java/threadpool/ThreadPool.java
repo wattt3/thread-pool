@@ -1,11 +1,13 @@
 package threadpool;
 
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
@@ -13,43 +15,22 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class ThreadPool implements Executor {
 
+    private static final Thread[] EMPTY_THREADS_ARRAY = new Thread[0];
     private static final Runnable SHUTDOWN_TASK = () -> {
     };
 
     private final int maxNumThreads;
+    private final long idleTimeoutNanos;
     private final BlockingQueue<Runnable> queue = new LinkedTransferQueue<>();
     private final AtomicBoolean shutdown = new AtomicBoolean();
     private final Set<Thread> threads = new HashSet<>();
     private final Lock threadsLock = new ReentrantLock();
     private final AtomicInteger numThreads = new AtomicInteger();
-    private final AtomicInteger numActiveThreads = new AtomicInteger();
+    private final AtomicInteger numBusyThreads = new AtomicInteger();
 
-    public ThreadPool(int maxNumThreads) {
+    public ThreadPool(int maxNumThreads, Duration idleTimeout) {
         this.maxNumThreads = maxNumThreads;
-    }
-
-    private Thread newThread() {
-        numThreads.incrementAndGet();
-        return new Thread(() -> {
-            for (; ; ) {
-                try {
-                    final Runnable task = queue.take();
-                    if (task == SHUTDOWN_TASK) {
-                        break;
-                    } else {
-                        task.run();
-                    }
-                } catch (Throwable t) {
-                    if (!(t instanceof InterruptedException)) {
-                        System.err.println("Unexpected exception: ");
-                        t.printStackTrace();
-                    }
-                } finally {
-                    numThreads.decrementAndGet();
-                }
-            }
-            System.err.println("Shutting thread `" + Thread.currentThread().getName() + "`");
-        });
+        idleTimeoutNanos = idleTimeout.toNanos();
     }
 
     @Override
@@ -60,7 +41,6 @@ public class ThreadPool implements Executor {
 
         queue.add(command);
         addThreadIfNecessary();
-
         if (shutdown.get()) {
             queue.remove(command);
             throw new RejectedExecutionException();
@@ -68,28 +48,116 @@ public class ThreadPool implements Executor {
     }
 
     private void addThreadIfNecessary() {
-        final int numActiveThreads = this.numActiveThreads.get();
-        if (needsMoreThreads(numActiveThreads)) {
-            addThreadIfNecessaryLocked();
-        }
-    }
+        if (needsMoreThreads()) {
+            threadsLock.lock();
+            Thread newThread = null;
+            try {
+                // Note that we check if the pool is shut down only *after* acquiring the lock,
+                // because:
+                // - shutting down a pool doesn't occur very often; and
+                // - it's not worth checking whether the pool is shut down or not frequently.
+                if (needsMoreThreads() && !shutdown.get()) {
+                    newThread = newThread();
+                }
+            } finally {
+                threadsLock.unlock();
+            }
 
-    private void addThreadIfNecessaryLocked() {
-        threadsLock.lock();
-        try {
-            final int numActiveThreads2 = this.numActiveThreads.get();
-            if (needsMoreThreads(numActiveThreads2)) {
-                final Thread newThread = newThread();
-                threads.add(newThread);
+            // Call `Thread.start()` call out of the lock window to minimize the contention.
+            if (newThread != null) {
                 newThread.start();
             }
-        } finally {
-            threadsLock.unlock();
         }
     }
 
-    private boolean needsMoreThreads(int numActiveThreads) {
-        return numActiveThreads < maxNumThreads && numActiveThreads >= numThreads.get();
+    private boolean needsMoreThreads() {
+        final int numBusyThreads = this.numBusyThreads.get();
+        final int numThreads = this.numThreads.get();
+        return numBusyThreads >= numThreads && numBusyThreads < maxNumThreads;
+    }
+
+    private Thread newThread() {
+        numThreads.incrementAndGet();
+        numBusyThreads.incrementAndGet();
+        final Thread thread = new Thread(() -> {
+            System.err.println("Started a new thread: " + Thread.currentThread().getName());
+            boolean isBusy = true;
+            long lastRunTimeNanos = System.nanoTime();
+            try {
+                for (; ; ) {
+                    try {
+                        Runnable task = queue.poll();
+                        if (task == null) {
+                            if (isBusy) {
+                                isBusy = false;
+                                numBusyThreads.decrementAndGet();
+                                System.err.println(Thread.currentThread().getName() + " idle");
+                            }
+
+                            final long waitTimeNanos =
+                                idleTimeoutNanos - (System.nanoTime() - lastRunTimeNanos);
+                            if (waitTimeNanos <= 0 ||
+                                (task = queue.poll(waitTimeNanos, TimeUnit.NANOSECONDS)) == null) {
+                                // The thread didn't handle any tasks for a while.
+                                break;
+                            }
+                            isBusy = true;
+                            numBusyThreads.incrementAndGet();
+                            System.err.println(Thread.currentThread().getName() + " busy");
+                        } else {
+                            if (!isBusy) {
+                                isBusy = true;
+                                numBusyThreads.incrementAndGet();
+                                System.err.println(Thread.currentThread().getName() + " busy");
+                            }
+                        }
+
+                        if (task == SHUTDOWN_TASK) {
+                            break;
+                        } else {
+                            try {
+                                task.run();
+                            } finally {
+                                lastRunTimeNanos = System.nanoTime();
+                            }
+                        }
+                    } catch (Throwable t) {
+                        if (!(t instanceof InterruptedException)) {
+                            System.err.println("Unexpected exception: ");
+                            t.printStackTrace();
+                        }
+                    }
+                }
+            } finally {
+                threadsLock.lock();
+                try {
+                    threads.remove(Thread.currentThread());
+                    numThreads.decrementAndGet();
+                    if (isBusy) {
+                        numBusyThreads.decrementAndGet();
+                        System.err.println(Thread.currentThread().getName() + " idle (timed out)");
+                    }
+
+                    if (threads.isEmpty() && !queue.isEmpty()) {
+                        for (Runnable task : queue) {
+                            if (task != SHUTDOWN_TASK) {
+                                // We found the situation where:
+                                // - there are no active threads available; and
+                                // - there is a task in the queue.
+                                // Start a new thread so that it's picked up.
+                                addThreadIfNecessary();
+                                break;
+                            }
+                        }
+                    }
+                } finally {
+                    threadsLock.unlock();
+                }
+                System.err.println("Shutting thread '" + Thread.currentThread().getName() + '\'');
+            }
+        });
+        threads.add(thread);
+        return thread;
     }
 
     public void shutdown() {
@@ -99,15 +167,28 @@ public class ThreadPool implements Executor {
             }
         }
 
-        // FIXME: Fix the race condition where a new thread is added by execute()
-        for (Thread thread : threads) {
-            do {
-                try {
-                    thread.join();
-                } catch (InterruptedException e) {
-                    // Do not propagate to prevent incomplete shutdown.
-                }
-            } while (thread.isAlive());
+        for (; ; ) {
+            final Thread[] threads;
+            threadsLock.lock();
+            try {
+                threads = this.threads.toArray(EMPTY_THREADS_ARRAY);
+            } finally {
+                threadsLock.unlock();
+            }
+
+            if (threads.length == 0) {
+                break;
+            }
+
+            for (Thread thread : threads) {
+                do {
+                    try {
+                        thread.join();
+                    } catch (InterruptedException e) {
+                        // Do not propagate to prevent incomplete shutdown.
+                    }
+                } while (thread.isAlive());
+            }
         }
     }
 }
